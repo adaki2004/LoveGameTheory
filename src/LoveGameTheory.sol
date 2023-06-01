@@ -13,6 +13,10 @@ contract LoveGameTheory is ERC1155, Ownable {
         uint256 passPrice;
         /// @dev To know how many in existence
         uint256 inCirculation;
+        /// @dev MP revenue for artist
+        uint256 artistRev;
+        /// @dev Artist's claim address
+        address artistAddress;
         /// @dev MagicContract
         address magicBurner;
         /// @dev Option to close a minting period for a specific MintPass type
@@ -32,6 +36,7 @@ contract LoveGameTheory is ERC1155, Ownable {
     event MintPassPriceEdited(uint256 mintPassId, uint256 newPrice);
     event MintPassMintStatusEdited(uint256 mintPassId, bool mintingClosed);
     event MintPassMagicContractEdited(uint256 mintPassId, address magicContract);
+    event MintPassArtistAddressEdited(uint256 mintPassId, address artistAddress);
     event MintPassMinted(uint256 index, address indexed user, uint256 amount);
     event MintPassBurnt(uint256 index, address indexed user, uint256 amount);
 
@@ -42,16 +47,31 @@ contract LoveGameTheory is ERC1155, Ownable {
     address public _currency = 0x11244ff7959d8E31A430a5D19F54912b67A0B209;
     //On mainnet:
     //address public _currency = 0xB22C05CeDbF879a661fcc566B5a759d005Cf7b4C;
-    // Revenue recipient
-    address public _recipient = 0x02845f44008E603527dBcF8fB513037bda21f73f;
     // Dead wallet
     address public _dead = 0x000000000000000000000000000000000000dEaD;
+
+    // Non reentrancy lock
+    bool internal locked;
+
+    // Dev and LOVE treasury related
+    uint256 _dev;
+    address _devAdress = address(0);
+    uint256 _loveTreasury;
+    address _loveTreasuryAddress = address(0);
 
     /// @notice Check that a mint pass with given id exists
     /// @param id - Id of the mint pass
     modifier mpExists(uint256 id) {
         require(_mintPasses[id].passPrice != 0, 'Mint pass does not exists');
         _;
+    }
+
+    /// @notice Reentrancy guard
+    modifier noReentrant() {
+        require(!locked);
+        locked = true;
+        _;
+        locked = false;
     }
 
     constructor(string memory baseUri) ERC1155(baseUri) {}
@@ -68,6 +88,8 @@ contract LoveGameTheory is ERC1155, Ownable {
         MintPass memory mp = MintPass(
             price,
             0,
+            0,
+            address(0),
             address(0),
             mintingClosed
         );
@@ -116,7 +138,7 @@ contract LoveGameTheory is ERC1155, Ownable {
         emit MintPassMintStatusEdited(mintPassId, mintingClosed);
     }
 
-    /// @notice Mintpass' minting status parameter editing
+    /// @notice Mintpass' redeem contract setter
     /// @param mintPassId - The id of the pass
     /// @param magicBurner - Magic contract address which will be able to burn
     function editMagicContract(uint256 mintPassId, address magicBurner)
@@ -133,6 +155,59 @@ contract LoveGameTheory is ERC1155, Ownable {
         emit MintPassMagicContractEdited(mintPassId, magicBurner);
     }
 
+    /// @notice Mintpass' artists address setter
+    /// @param mintPassId - The id of the pass
+    /// @param artistAddress - Artist address which  the funds will be distributed
+    function editArtistAddressContract(uint256 mintPassId, address artistAddress)
+        external
+        onlyOwner
+        mpExists(mintPassId)
+    {
+        MintPass memory mp = _mintPasses[mintPassId];
+
+        /// @dev Modify the value and write back
+        mp.artistAddress = artistAddress;
+        _mintPasses[mintPassId] = mp;
+
+        emit MintPassArtistAddressEdited(mintPassId, artistAddress);
+    }
+
+    /// @notice Dev funds claiming - anoyone can claim but goes to dev anyways :)
+    function claimDev()
+        noReentrant
+        external
+    {
+        if (_devAdress != address(0)) {
+            CurrencyTransferLib.transferCurrency(_currency,  address(this), _devAdress, _dev);
+            _dev = 0;
+        }
+    }
+
+    /// @notice LOVE Treasury funds claiming - anoyone can claim but goes to treasury anyways :)
+    function claimLoveTreasury()
+        noReentrant
+        external
+    {
+        if (_loveTreasuryAddress != address(0)) {
+            CurrencyTransferLib.transferCurrency(_currency,  address(this), _loveTreasuryAddress, _loveTreasury);
+            _loveTreasury = 0;
+        }
+    }
+
+    /// @notice Aritst funds claiming - anoyone can claim but goes to artist anyways :)
+    function claimArtist(uint256 mintPassId)
+        external
+        noReentrant
+        mpExists(mintPassId)
+    {
+        MintPass memory mp = _mintPasses[mintPassId];
+
+        if (mp.artistAddress != address(0)) {
+            CurrencyTransferLib.transferCurrency(_currency,  address(this), mp.artistAddress, mp.artistRev);
+            _mintPasses[mintPassId].artistRev = 0;
+        }
+    }
+
     /// @notice This function mints the passes to the user
     /// @param mintPassId - The id of the pass
     /// @param amount - Amount to be minted for the user
@@ -147,17 +222,27 @@ contract LoveGameTheory is ERC1155, Ownable {
         );
         
         uint256 totalPrice = amount * _mintPasses[mintPassId].passPrice;
-        // 33% burnt
-        uint256 burnAmount = (totalPrice * 3300) / 10000;
-        uint256 contractAndArtistRev = totalPrice - burnAmount;
+        // Burn one third of the LOVE revenue
+        uint256 one_third_amount = (totalPrice * 3300) / 10000;
 
-        CurrencyTransferLib.transferCurrency(_currency, msg.sender, _dead, burnAmount);
-        CurrencyTransferLib.transferCurrency(_currency, msg.sender, _recipient, contractAndArtistRev);
+        // 33% to artist and his/her community 
+        _mintPasses[mintPassId].artistRev += one_third_amount;
+
+        // Rest of 33% is for dev + LOVE Treasury
+        _loveTreasury += one_third_amount/2;
+        _dev += one_third_amount/2;
+
+        uint256 storeAtContract = totalPrice - one_third_amount;
+
+        // Burn 33% of LOVE
+        CurrencyTransferLib.transferCurrency(_currency, msg.sender, _dead, one_third_amount);
+        // Store rest in contract until claimed
+        CurrencyTransferLib.transferCurrency(_currency, msg.sender, address(this), storeAtContract);
 
         _mint(msg.sender, mintPassId, amount, '');
 
         _mintPasses[mintPassId].inCirculation += amount;
-
+        
         emit MintPassMinted(mintPassId, msg.sender, amount);
     }
 
@@ -191,10 +276,10 @@ contract LoveGameTheory is ERC1155, Ownable {
 
     /** GETTERS */
 
-    /// @notice Returns the mint count (including the ones which are burnt already)
+    /// @notice Returns the circulation count (including the ones which are burnt already)
     /// @param mintPassId - The id of the pass
     /// @return uint256 - The number of mints
-    function getMintCount(uint256 mintPassId) external view mpExists(mintPassId) returns (uint256) {
+    function getCirculationCount(uint256 mintPassId) external view mpExists(mintPassId) returns (uint256) {
         return _mintPasses[mintPassId].inCirculation;
     }
 
@@ -212,10 +297,16 @@ contract LoveGameTheory is ERC1155, Ownable {
 
     /** SETTERS */
 
-    /// @notice Set the new revenue recipient
+    /// @notice Set the dev revenue recipient
     /// @param newRecipient Address to set as new recipient
-    function setRecipient(address newRecipient) external onlyOwner {
-        _recipient = newRecipient;
+    function setDevAddress(address newRecipient) external onlyOwner {
+        _devAdress = newRecipient;
+    }
+
+    /// @notice Set the treasury revenue recipient
+    /// @param newRecipient Address to set as new recipient
+    function setLoveTreasuryAddress(address newRecipient) external onlyOwner {
+        _loveTreasuryAddress = newRecipient;
     }
 
     /// @notice Set the new currency
